@@ -16,8 +16,12 @@ ucimlrepo>=0.0.3
 streamlit>=1.28.0
 plotly>=5.18.0
 
+
 # Model serialization
 joblib>=1.3.0
 
 # Progress bars
 tqdm>=4.66.0
+
+# AI Chatbot
+google-generativeai>=0.3.0

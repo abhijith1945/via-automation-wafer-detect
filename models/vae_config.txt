@@ -1,0 +1,1 @@
+LATENT_DIM=64
