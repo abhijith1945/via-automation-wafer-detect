@@ -14,6 +14,34 @@ import time
 import os
 from datetime import datetime
 import sys
+import sqlite3
+from io import BytesIO
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import base64
+
+# PDF Generation
+try:
+    from fpdf import FPDF
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+# Excel Export
+try:
+    import openpyxl
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+
+# QR Code Generation
+try:
+    import qrcode
+    from io import BytesIO as QRBytesIO
+    QR_AVAILABLE = True
+except ImportError:
+    QR_AVAILABLE = False
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -270,6 +298,8 @@ def add_to_history(result):
     st.session_state.prediction_history.insert(0, result)
     if len(st.session_state.prediction_history) > 100:
         st.session_state.prediction_history = st.session_state.prediction_history[:100]
+    # Also save to database
+    save_to_database(result)
 
 def generate_csv_report():
     if not st.session_state.prediction_history:
@@ -278,9 +308,519 @@ def generate_csv_report():
     return df.to_csv(index=False)
 
 # ============================================================
+# DATABASE FUNCTIONS
+# ============================================================
+def init_database():
+    """Initialize SQLite database for storing predictions"""
+    conn = sqlite3.connect('data/wafer_predictions.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wafer_id TEXT,
+            timestamp TEXT,
+            pressure REAL,
+            temperature REAL,
+            flow_rate REAL,
+            rf_power REAL,
+            prediction TEXT,
+            defect_type TEXT,
+            confidence REAL,
+            probability REAL,
+            healing_action TEXT,
+            healing_value TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_to_database(result):
+    """Save prediction result to database"""
+    try:
+        conn = sqlite3.connect('data/wafer_predictions.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO predictions 
+            (wafer_id, timestamp, pressure, temperature, flow_rate, rf_power, 
+             prediction, defect_type, confidence, probability, healing_action, healing_value)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            result['wafer_id'], result['timestamp'], result['pressure'],
+            result['temperature'], result['flow_rate'], result['rf_power'],
+            result['prediction'], result['defect_type'], result['confidence'],
+            result['probability'], result['healing_action'], result['healing_value']
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        pass  # Silently fail if database error
+
+def get_database_stats():
+    """Get statistics from database"""
+    try:
+        conn = sqlite3.connect('data/wafer_predictions.db')
+        cursor = conn.cursor()
+        
+        # Total predictions
+        cursor.execute('SELECT COUNT(*) FROM predictions')
+        total = cursor.fetchone()[0]
+        
+        # Pass/Fail counts
+        cursor.execute("SELECT COUNT(*) FROM predictions WHERE prediction='PASS'")
+        passed = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM predictions WHERE prediction='FAIL'")
+        failed = cursor.fetchone()[0]
+        
+        # Recent predictions
+        cursor.execute('SELECT * FROM predictions ORDER BY id DESC LIMIT 10')
+        recent = cursor.fetchall()
+        
+        conn.close()
+        return {'total': total, 'passed': passed, 'failed': failed, 'recent': recent}
+    except:
+        return {'total': 0, 'passed': 0, 'failed': 0, 'recent': []}
+
+# Initialize database on startup
+init_database()
+
+# ============================================================
+# PDF REPORT GENERATION
+# ============================================================
+def generate_pdf_report(result):
+    """Generate a professional PDF report for a wafer analysis"""
+    if not PDF_AVAILABLE:
+        return None
+    
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Header
+    pdf.set_font('Helvetica', 'B', 24)
+    pdf.set_text_color(30, 60, 114)
+    pdf.cell(0, 15, 'Virtual Metrology Report', ln=True, align='C')
+    
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 8, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', ln=True, align='C')
+    pdf.ln(10)
+    
+    # Wafer Info Box
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.cell(0, 10, f'Wafer ID: {result["wafer_id"]}', ln=True, fill=True)
+    pdf.ln(5)
+    
+    # Result Box
+    if result['prediction'] == 'PASS':
+        pdf.set_fill_color(212, 237, 218)
+        pdf.set_text_color(40, 167, 69)
+    else:
+        pdf.set_fill_color(248, 215, 218)
+        pdf.set_text_color(220, 53, 69)
+    
+    pdf.set_font('Helvetica', 'B', 20)
+    pdf.cell(0, 15, f'RESULT: {result["prediction"]}', ln=True, align='C', fill=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(5)
+    
+    # Confidence
+    pdf.set_font('Helvetica', '', 12)
+    pdf.cell(0, 8, f'Confidence: {result["confidence"]:.1%}', ln=True, align='C')
+    pdf.cell(0, 8, f'Defect Type: {result["defect_type"]}', ln=True, align='C')
+    pdf.ln(10)
+    
+    # Sensor Readings Table
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.set_text_color(30, 60, 114)
+    pdf.cell(0, 10, 'Sensor Readings', ln=True)
+    pdf.set_text_color(0, 0, 0)
+    
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_fill_color(30, 60, 114)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(95, 8, 'Parameter', border=1, fill=True, align='C')
+    pdf.cell(95, 8, 'Value', border=1, fill=True, align='C')
+    pdf.ln()
+    
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(0, 0, 0)
+    
+    readings = [
+        ('Chamber Pressure', f'{result["pressure"]} Pa'),
+        ('Etch Temperature', f'{result["temperature"]} °C'),
+        ('Gas Flow Rate', f'{result["flow_rate"]} sccm'),
+        ('RF Power', f'{result["rf_power"]} W'),
+    ]
+    
+    for param, value in readings:
+        pdf.cell(95, 8, param, border=1, align='C')
+        pdf.cell(95, 8, value, border=1, align='C')
+        pdf.ln()
+    
+    pdf.ln(10)
+    
+    # Self-Healing Recommendation
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.set_text_color(30, 60, 114)
+    pdf.cell(0, 10, 'Self-Healing Recommendation', ln=True)
+    pdf.set_text_color(0, 0, 0)
+    
+    pdf.set_font('Helvetica', '', 11)
+    pdf.set_fill_color(255, 243, 205)
+    pdf.multi_cell(0, 8, f'Action: {result["healing_action"]}\nAdjustment: {result["healing_value"]}', fill=True)
+    
+    pdf.ln(15)
+    
+    # Footer
+    pdf.set_font('Helvetica', 'I', 8)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 10, 'Generated by Virtual Metrology System v3.0 - Enterprise Edition', ln=True, align='C')
+    
+    return bytes(pdf.output())
+
+# ============================================================
+# EXCEL EXPORT
+# ============================================================
+def generate_excel_report(data):
+    """Generate Excel file from prediction data"""
+    if not EXCEL_AVAILABLE:
+        return None
+    
+    df = pd.DataFrame(data)
+    output = BytesIO()
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Predictions', index=False)
+        
+        # Auto-adjust column widths
+        worksheet = writer.sheets['Predictions']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    output.seek(0)
+    return output.getvalue()
+
+# ============================================================
+# EMAIL ALERT FUNCTION
+# ============================================================
+def send_email_alert(result, recipient_email="engineer@semiconductor.com"):
+    """Send email alert when FAIL is detected"""
+    try:
+        # Email configuration
+        SENDER_EMAIL = "abhijithsubash2006@gmail.com"
+        SENDER_PASSWORD = "xcuo mlmh rwfp eevh"
+        
+        # Create message
+        msg = MIMEMultipart('alternative')
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient_email
+        msg['Subject'] = f"🚨 WAFER ALERT: {result['wafer_id']} - {result['prediction']}"
+        
+        # HTML email body
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+            <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                <div style="background: linear-gradient(135deg, #dc3545, #c82333); color: white; padding: 20px; text-align: center;">
+                    <h1 style="margin: 0;">🚨 Wafer Quality Alert</h1>
+                </div>
+                
+                <div style="padding: 20px;">
+                    <h2 style="color: #333; border-bottom: 2px solid #dc3545; padding-bottom: 10px;">Wafer Details</h2>
+                    
+                    <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                        <tr style="background-color: #f8f9fa;">
+                            <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Wafer ID</strong></td>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;">{result['wafer_id']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Timestamp</strong></td>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;">{result['timestamp']}</td>
+                        </tr>
+                        <tr style="background-color: #f8d7da;">
+                            <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Prediction</strong></td>
+                            <td style="padding: 12px; border: 1px solid #dee2e6; color: #dc3545; font-weight: bold; font-size: 18px;">{result['prediction']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Confidence</strong></td>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;">{result['confidence']:.1%}</td>
+                        </tr>
+                        <tr style="background-color: #f8f9fa;">
+                            <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Defect Type</strong></td>
+                            <td style="padding: 12px; border: 1px solid #dee2e6;">{result['defect_type']}</td>
+                        </tr>
+                    </table>
+                    
+                    <h3 style="color: #333;">📊 Sensor Readings</h3>
+                    <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+                        <tr style="background-color: #e9ecef;">
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">🌡️ Temperature</td>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">{result['temperature']}°C</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">🔵 Pressure</td>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">{result['pressure']} Pa</td>
+                        </tr>
+                        <tr style="background-color: #e9ecef;">
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">💨 Flow Rate</td>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">{result['flow_rate']} sccm</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">⚡ RF Power</td>
+                            <td style="padding: 10px; border: 1px solid #dee2e6;">{result['rf_power']} W</td>
+                        </tr>
+                    </table>
+                    
+                    <div style="background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; padding: 15px; margin: 15px 0;">
+                        <h3 style="color: #856404; margin-top: 0;">🔧 Recommended Action</h3>
+                        <p style="margin: 0; font-size: 16px;"><strong>{result['healing_action']}</strong></p>
+                        <p style="margin: 5px 0 0 0; color: #856404;">Adjustment: {result['healing_value']}</p>
+                    </div>
+                </div>
+                
+                <div style="background-color: #f8f9fa; padding: 15px; text-align: center; border-top: 1px solid #dee2e6;">
+                    <p style="margin: 0; color: #6c757d; font-size: 12px;">
+                        📧 Sent by Virtual Metrology System (VIA) v3.0<br>
+                        Enterprise Edition | AI-Powered Quality Control
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Plain text version
+        text_body = f"""
+        WAFER QUALITY ALERT
+        ===================
+        
+        Wafer ID: {result['wafer_id']}
+        Timestamp: {result['timestamp']}
+        Prediction: {result['prediction']}
+        Confidence: {result['confidence']:.1%}
+        Defect Type: {result['defect_type']}
+        
+        Sensor Readings:
+        - Temperature: {result['temperature']}°C
+        - Pressure: {result['pressure']} Pa
+        - Flow Rate: {result['flow_rate']} sccm
+        - RF Power: {result['rf_power']} W
+        
+        Recommended Action: {result['healing_action']}
+        Adjustment: {result['healing_value']}
+        
+        ---
+        Virtual Metrology System v3.0
+        """
+        
+        msg.attach(MIMEText(text_body, 'plain'))
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        # Send email via Gmail SMTP
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        # Store in session for display
+        if 'email_alerts' not in st.session_state:
+            st.session_state.email_alerts = []
+        
+        st.session_state.email_alerts.insert(0, {
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'wafer_id': result['wafer_id'],
+            'recipient': recipient_email,
+            'sent': True
+        })
+        
+        # Keep only last 10 alerts
+        st.session_state.email_alerts = st.session_state.email_alerts[:10]
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"📧 Email failed: {str(e)}")
+        return False
+
+# ============================================================
+# SHAP-STYLE EXPLAINABILITY
+# ============================================================
+def get_shap_explanation(result):
+    """Generate SHAP-style feature contribution explanation"""
+    
+    # Calculate feature contributions based on deviation from optimal
+    temp_optimal = 450
+    pressure_optimal = 100
+    flow_optimal = 50
+    rf_optimal = 1000
+    
+    # Calculate deviations (normalized)
+    temp_dev = (result['temperature'] - temp_optimal) / 100
+    pressure_dev = (result['pressure'] - pressure_optimal) / 10
+    flow_dev = (result['flow_rate'] - flow_optimal) / 10
+    rf_dev = (result['rf_power'] - rf_optimal) / 200
+    
+    # Feature contributions (positive = increases fail probability)
+    contributions = {
+        'Temperature': {
+            'value': result['temperature'],
+            'contribution': temp_dev * 0.35,
+            'optimal': f"{temp_optimal}°C",
+            'status': '🔴 High' if result['temperature'] > 500 else ('🟡 Warning' if result['temperature'] > 480 else '🟢 OK')
+        },
+        'Pressure': {
+            'value': result['pressure'],
+            'contribution': abs(pressure_dev) * 0.25,
+            'optimal': f"{pressure_optimal} Pa",
+            'status': '🔴 Abnormal' if abs(result['pressure'] - 100) > 5 else '🟢 OK'
+        },
+        'Gas Flow': {
+            'value': result['flow_rate'],
+            'contribution': abs(flow_dev) * 0.20,
+            'optimal': f"{flow_optimal} sccm",
+            'status': '🔴 Abnormal' if abs(result['flow_rate'] - 50) > 5 else '🟢 OK'
+        },
+        'RF Power': {
+            'value': result['rf_power'],
+            'contribution': abs(rf_dev) * 0.20,
+            'optimal': f"{rf_optimal} W",
+            'status': '🔴 Abnormal' if abs(result['rf_power'] - 1000) > 100 else '🟢 OK'
+        }
+    }
+    
+    # Sort by absolute contribution
+    sorted_contributions = dict(sorted(contributions.items(), 
+                                       key=lambda x: abs(x[1]['contribution']), 
+                                       reverse=True))
+    
+    return sorted_contributions
+
+def display_shap_waterfall(result):
+    """Display SHAP waterfall chart"""
+    contributions = get_shap_explanation(result)
+    
+    features = list(contributions.keys())
+    values = [contributions[f]['contribution'] for f in features]
+    
+    # Colors based on contribution direction
+    colors = ['#ff4444' if v > 0 else '#44aa44' for v in values]
+    
+    fig = go.Figure(go.Waterfall(
+        name="Feature Contribution",
+        orientation="h",
+        y=features,
+        x=values,
+        connector={"line": {"color": "rgb(63, 63, 63)"}},
+        decreasing={"marker": {"color": "#44aa44"}},
+        increasing={"marker": {"color": "#ff4444"}},
+        totals={"marker": {"color": "#0066cc"}},
+        text=[f"{v:+.2f}" for v in values],
+        textposition="outside"
+    ))
+    
+    fig.update_layout(
+        title="Feature Contributions to Prediction",
+        xaxis_title="Impact on FAIL Probability",
+        height=300,
+        showlegend=False
+    )
+    
+    return fig
+
+# ============================================================
+# SOUND ALERT FUNCTION
+# ============================================================
+def play_alert_sound():
+    """Play alert sound using HTML audio (browser-based)"""
+    # Using a base64 encoded beep sound
+    alert_sound_html = """
+    <audio autoplay>
+        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2teleQALJKD43/CsJQAFLqP3/ewsAAArneHl6TEAAiOKyMnTOwACH4S+w9dBABYbfbq/11oAJBB1tLvbagApCHCytNxtAC0BbbCt32UAPgJqravYWgBWAGmqpdNJAHAAaa+gzDgAigBtrJ3KLgCkAHOqm8gjALwAfqucxhoA0ACHqqO+EQDnAJCno7oJAAAAmqSnuAUA/ACjo6m3AAD2AKuiqrcAAPAAs6Gqtv8A6gC7oKu1/QDkAMOfq7X8AN4Ayp+stPwA2ADRnq20/ADSANmdrLT8AMwA4Jyst" type="audio/wav">
+    </audio>
+    """
+    st.markdown(alert_sound_html, unsafe_allow_html=True)
+
+# ============================================================
+# QR CODE GENERATION
+# ============================================================
+def generate_qr_code(url):
+    """Generate QR code for mobile access"""
+    if not QR_AVAILABLE:
+        return None
+    
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    buffer = QRBytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    
+    return buffer.getvalue()
+
+# ============================================================
+# THEME CONFIGURATION
+# ============================================================
+def get_theme_css(dark_mode):
+    """Get CSS for dark/light theme"""
+    if dark_mode:
+        return """
+        <style>
+            .stApp {
+                background-color: #1a1a2e;
+                color: #eaeaea;
+            }
+            .main-header {
+                background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+            .css-1d391kg {
+                background-color: #16213e;
+            }
+            .stMetric {
+                background-color: #0f3460;
+                border-radius: 10px;
+                padding: 10px;
+            }
+        </style>
+        """
+    else:
+        return ""
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 st.sidebar.markdown("## 🎛️ Control Panel")
+
+# Theme Toggle
+st.sidebar.markdown("### 🎨 Theme")
+dark_mode = st.sidebar.toggle("🌙 Dark Mode", value=False)
+if dark_mode:
+    st.markdown(get_theme_css(True), unsafe_allow_html=True)
+
+# Sound Alerts Toggle
+sound_alerts = st.sidebar.toggle("🔊 Sound Alerts", value=True, help="Play sound on FAIL detection")
+
+st.sidebar.markdown("---")
 
 # Mode selection
 mode = st.sidebar.radio(
@@ -295,6 +835,15 @@ if mode == "🔬 Single Wafer":
     auto_simulate = st.sidebar.checkbox("🔄 Auto-Simulate (Live Demo)", value=False, help="Automatically generate new wafer readings every few seconds")
     if auto_simulate:
         sim_interval = st.sidebar.slider("Simulation Interval (sec)", 2, 10, 4)
+    
+    # Email alerts toggle
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📧 Alert Settings")
+    email_alerts_enabled = st.sidebar.checkbox("📧 Enable Email Alerts", value=True, help="Send email notification on FAIL")
+    if email_alerts_enabled:
+        alert_email = st.sidebar.text_input("📬 Alert Email", value="engineer@semiconductor.com")
+    else:
+        alert_email = None
 
 st.sidebar.markdown("---")
 
@@ -352,6 +901,215 @@ if st.session_state.prediction_history:
         mime="text/csv",
         use_container_width=True
     )
+
+# QR Code for Mobile Access - LOCAL & GLOBAL
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📱 Mobile & Global Access")
+
+# Get the network URL
+try:
+    import socket
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+except:
+    local_ip = "localhost"
+
+# Store the URL in session state
+if 'app_port' not in st.session_state:
+    st.session_state.app_port = "8509"
+
+local_url = f"http://{local_ip}:{st.session_state.app_port}"
+
+# Initialize ngrok state
+if 'ngrok_url' not in st.session_state:
+    st.session_state.ngrok_url = None
+if 'ngrok_active' not in st.session_state:
+    st.session_state.ngrok_active = False
+
+# Function to generate QR code
+def generate_qr_code(url, size=180):
+    """Generate QR code as bytes"""
+    try:
+        import qrcode
+        from io import BytesIO
+        
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        
+        buffer = BytesIO()
+        qr_img.save(buffer, format='PNG')
+        return buffer.getvalue()
+    except Exception as e:
+        return None
+
+with st.sidebar.expander("📲 Access Options", expanded=False):
+    
+    # Access mode selection
+    access_mode = st.radio(
+        "🌐 Access Mode:",
+        ["🏠 Local Network", "🌍 Global Access (ngrok)"],
+        key="access_mode_radio"
+    )
+    
+    st.markdown("---")
+    
+    if access_mode == "🏠 Local Network":
+        # LOCAL NETWORK ACCESS
+        st.markdown("**📍 Local Network URL:**")
+        st.code(local_url, language=None)
+        st.caption("⚠️ Works only on same WiFi network")
+        
+        # Generate QR for local URL
+        qr_bytes = generate_qr_code(local_url)
+        if qr_bytes:
+            st.image(qr_bytes, caption="📱 Scan for Local Access", width=180)
+            st.download_button(
+                label="⬇️ Download QR",
+                data=qr_bytes,
+                file_name="via_local_qr.png",
+                mime="image/png",
+                use_container_width=True
+            )
+        else:
+            st.warning("QR generation failed")
+        
+        current_url = local_url
+        
+    else:
+        # GLOBAL ACCESS via ngrok
+        st.markdown("**🌍 Global Access (ngrok)**")
+        st.caption("Access from anywhere in the world!")
+        
+        # ngrok setup instructions
+        if not st.session_state.ngrok_url:
+            st.info("""
+            **Setup ngrok for Global Access:**
+            
+            1️⃣ Sign up at [ngrok.com](https://ngrok.com) (free)
+            
+            2️⃣ Get your authtoken from dashboard
+            
+            3️⃣ Enter token below:
+            """)
+            
+            ngrok_token = st.text_input(
+                "🔑 ngrok Authtoken:",
+                type="password",
+                key="ngrok_token_input",
+                help="Get free token from ngrok.com dashboard"
+            )
+            
+            if st.button("🚀 Start Global Tunnel", use_container_width=True, type="primary"):
+                if ngrok_token:
+                    with st.spinner("Creating global tunnel..."):
+                        try:
+                            from pyngrok import ngrok, conf
+                            
+                            # Set authtoken
+                            conf.get_default().auth_token = ngrok_token
+                            
+                            # Close existing tunnels
+                            try:
+                                ngrok.kill()
+                            except:
+                                pass
+                            
+                            # Create new tunnel
+                            public_url = ngrok.connect(8509, "http")
+                            st.session_state.ngrok_url = public_url.public_url
+                            st.session_state.ngrok_active = True
+                            st.success("✅ Global tunnel created!")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"❌ Failed: {str(e)}")
+                            st.info("Check your authtoken or internet connection")
+                else:
+                    st.warning("Please enter your ngrok authtoken")
+            
+            # Alternative: Manual URL entry
+            st.markdown("---")
+            st.markdown("**🔗 Or enter existing public URL:**")
+            manual_url = st.text_input(
+                "Public URL:",
+                placeholder="https://your-app.streamlit.app",
+                key="manual_public_url"
+            )
+            if manual_url:
+                st.session_state.ngrok_url = manual_url
+                st.rerun()
+        
+        else:
+            # ngrok tunnel is active
+            st.success("✅ **Global Access Active!**")
+            st.markdown("**🌐 Public URL:**")
+            st.code(st.session_state.ngrok_url, language=None)
+            st.caption("🌍 Works from ANYWHERE in the world!")
+            
+            # Generate QR for global URL
+            qr_bytes = generate_qr_code(st.session_state.ngrok_url)
+            if qr_bytes:
+                st.image(qr_bytes, caption="📱 Scan for Global Access", width=180)
+                st.download_button(
+                    label="⬇️ Download Global QR",
+                    data=qr_bytes,
+                    file_name="via_global_qr.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+            
+            # Stop tunnel button
+            if st.button("🛑 Stop Global Tunnel", use_container_width=True):
+                try:
+                    from pyngrok import ngrok
+                    ngrok.kill()
+                except:
+                    pass
+                st.session_state.ngrok_url = None
+                st.session_state.ngrok_active = False
+                st.rerun()
+            
+            current_url = st.session_state.ngrok_url
+    
+    # Share options
+    st.markdown("---")
+    st.markdown("**📤 Share Options:**")
+    
+    # Determine which URL to share
+    share_url = st.session_state.ngrok_url if st.session_state.ngrok_url else local_url
+    
+    # Copy URL button
+    copy_js = f"""
+    <button onclick="navigator.clipboard.writeText('{share_url}'); alert('URL copied!');" 
+            style="width:100%; padding:8px; background:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer; margin-bottom:5px;">
+        📋 Copy URL
+    </button>
+    """
+    st.markdown(copy_js, unsafe_allow_html=True)
+    
+    # Share buttons
+    col_share1, col_share2 = st.columns(2)
+    with col_share1:
+        whatsapp_url = f"https://wa.me/?text=Access%20VIA%20Dashboard%3A%20{share_url}"
+        st.markdown(f"[📱 WhatsApp]({whatsapp_url})")
+    with col_share2:
+        email_body = f"Access the Virtual Metrology Dashboard at: {share_url}"
+        email_url = f"mailto:?subject=VIA Dashboard Access&body={email_body}"
+        st.markdown(f"[📧 Email]({email_url})")
+    
+    # Streamlit Cloud deployment option
+    st.markdown("---")
+    st.markdown("**☁️ Permanent Cloud Deployment:**")
+    st.caption("For always-on global access, deploy to Streamlit Cloud:")
+    st.markdown("[🚀 Deploy to Streamlit Cloud](https://share.streamlit.io)")
 
 # ============================================================
 # MAIN CONTENT
@@ -438,6 +1196,10 @@ if mode == "🔬 Single Wafer":
             else:
                 st.markdown('<div class="fail-box"><h2 style="color: #721c24; margin: 0;">🚨 ANOMALY</h2></div>', unsafe_allow_html=True)
                 st.metric("Defect Probability", f"{result['probability']:.1%}")
+                
+                # Play alert sound if enabled
+                if sound_alerts:
+                    play_alert_sound()
         
         # Level 2: Vision (only on FAIL)
         if result['prediction'] == "FAIL":
@@ -500,6 +1262,78 @@ if mode == "🔬 Single Wafer":
                     time.sleep(0.01)
                     healing_progress.progress(pct + 1)
                 st.success("✅ Action Applied!")
+            
+            # Send email alert if enabled
+            if 'email_alerts_enabled' in dir() and email_alerts_enabled and alert_email:
+                if send_email_alert(result, alert_email):
+                    st.info(f"📧 Alert sent to {alert_email}")
+        
+        # SHAP Explainability Section
+        st.markdown("---")
+        st.markdown("### 🧠 AI Explainability (SHAP-style)")
+        st.markdown('<span class="feature-badge">EXPLAINABLE AI</span>', unsafe_allow_html=True)
+        
+        shap_col1, shap_col2 = st.columns([2, 1])
+        
+        with shap_col1:
+            # Display waterfall chart
+            fig_shap = display_shap_waterfall(result)
+            st.plotly_chart(fig_shap, use_container_width=True)
+        
+        with shap_col2:
+            st.markdown("**📊 Feature Analysis**")
+            contributions = get_shap_explanation(result)
+            
+            for feature, data in contributions.items():
+                st.markdown(f"""
+                **{feature}:** {data['value']} {data['status']}
+                - Optimal: {data['optimal']}
+                - Impact: {data['contribution']:+.2f}
+                """)
+        
+        # Download buttons for reports
+        st.markdown("---")
+        st.markdown("### 📥 Download Reports")
+        
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
+        
+        with dl_col1:
+            if PDF_AVAILABLE:
+                pdf_data = generate_pdf_report(result)
+                if pdf_data:
+                    st.download_button(
+                        label="📄 Download PDF Report",
+                        data=pdf_data,
+                        file_name=f"wafer_report_{result['wafer_id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+            else:
+                st.info("Install fpdf2 for PDF reports")
+        
+        with dl_col2:
+            csv_data = pd.DataFrame([result]).to_csv(index=False)
+            st.download_button(
+                label="📊 Download CSV",
+                data=csv_data,
+                file_name=f"wafer_data_{result['wafer_id']}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        with dl_col3:
+            if EXCEL_AVAILABLE:
+                excel_data = generate_excel_report([result])
+                if excel_data:
+                    st.download_button(
+                        label="📗 Download Excel",
+                        data=excel_data,
+                        file_name=f"wafer_data_{result['wafer_id']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+            else:
+                st.info("Install openpyxl for Excel export")
     
     # History
     st.markdown("---")
@@ -582,6 +1416,35 @@ elif mode == "📦 Batch Processing":
         
         fig = px.pie(results_df, names='defect_type', title='Defect Distribution')
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Download buttons for batch results
+        st.markdown("### 📥 Download Batch Results")
+        
+        batch_dl_col1, batch_dl_col2 = st.columns(2)
+        
+        with batch_dl_col1:
+            csv_batch = results_df.to_csv(index=False)
+            st.download_button(
+                label="📊 Download CSV",
+                data=csv_batch,
+                file_name=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        with batch_dl_col2:
+            if EXCEL_AVAILABLE:
+                excel_batch = generate_excel_report(results_df.to_dict('records'))
+                if excel_batch:
+                    st.download_button(
+                        label="📗 Download Excel",
+                        data=excel_batch,
+                        file_name=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+            else:
+                st.info("Install openpyxl for Excel export")
     else:
         st.info("📤 Upload a CSV file or click 'Generate Demo Batch'")
 
@@ -728,6 +1591,19 @@ RECOMMENDED ACTIONS:
 # ============================================================
 elif mode == "📊 Analytics":
     st.subheader("📈 Analytics Dashboard")
+    
+    # Database Statistics
+    st.markdown("### 💾 Database Statistics")
+    db_stats = get_database_stats()
+    
+    db_col1, db_col2, db_col3, db_col4 = st.columns(4)
+    db_col1.metric("📊 Total Predictions", db_stats['total'])
+    db_col2.metric("✅ Total Passed", db_stats['passed'])
+    db_col3.metric("❌ Total Failed", db_stats['failed'])
+    yield_rate = (db_stats['passed'] / db_stats['total'] * 100) if db_stats['total'] > 0 else 0
+    db_col4.metric("📈 Overall Yield", f"{yield_rate:.1f}%")
+    
+    st.markdown("---")
     
     if not st.session_state.prediction_history:
         st.warning("⚠️ No prediction history. Analyze some wafers first!")
