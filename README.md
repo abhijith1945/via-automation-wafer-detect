@@ -134,7 +134,7 @@ Wafer → 590 Sensors → PASS/FAIL prediction
 ```bash
 # Clone the repository
 git clone https://github.com/abhijith1945/via-automation-wafer-detect.git
-cd via
+cd via-automation-wafer-detect
 
 # Create virtual environment
 python -m venv .venv
@@ -155,12 +155,37 @@ pip install -r requirements.txt
 # Train sensor model (Random Forest + SMOTE)
 python train.py
 
-# Train vision model (CNN)
+# Train vision model (CNN) - Synthetic data
+python train_vision.py
+
+# Train vision model (CNN) - Real NEU dataset
 python train_vision_real.py
+
+# Train on real WM-811K wafer maps
+python train_real_wafer.py
 
 # Train VAE for image generation
 python train_vae.py
 ```
+
+### Dataset Setup (For Training Vision Models)
+
+The vision models require external datasets that are not included in this repository:
+
+#### Option 1: NEU Surface Defect Dataset (for train_vision_real.py)
+1. Download from [NEU Surface Defect Database](http://faculty.neu.edu.cn/yunhyan/NEU_surface_defect_database.html)
+2. Extract to a local directory
+3. Update the `DATASET_PATH` in `train_vision_real.py` (line 23) to point to your extracted images folder
+
+#### Option 2: WM-811K Wafer Dataset (for train_real_wafer.py)
+1. Download LSWMD.pkl from [Kaggle WM-811K Dataset](https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map)
+2. Update the `DATASET_PATH` in `train_real_wafer.py` (line 19) to point to your downloaded file
+
+**Note:** The training scripts currently contain hardcoded local paths. You must update these paths before training:
+- `train_real_wafer.py` line 19: `DATASET_PATH`
+- `train_vision_real.py` line 23: `DATASET_PATH`
+
+**For Quick Start:** The system can run without training these models if you use the pre-trained models or synthetic data generation mode.
 
 ### Run the Application
 
@@ -231,6 +256,18 @@ Navigate to `http://localhost:8501` in your browser.
 
 > ⚠️ **Note**: Vision model trained on NEU metal surface data as proxy. For production, retrain with actual semiconductor wafer images.
 
+### Real Wafer Model (Optional)
+
+| Parameter | Value |
+|-----------|-------|
+| Script | train_real_wafer.py |
+| Architecture | CNN + VAE |
+| Training Data | WM-811K Wafer Map Dataset (LSWMD.pkl) |
+| Dataset Size | 2,000 wafer maps (configurable) |
+| Input Size | 64×64 (VAE), 128×128 (CNN) |
+
+> 💡 **Tip**: This script trains on real semiconductor wafer maps from the WM-811K dataset, providing more realistic defect patterns than synthetic data.
+
 ### VAE Generator
 
 | Parameter | Value |
@@ -245,11 +282,12 @@ Navigate to `http://localhost:8501` in your browser.
 ## 📁 Project Structure
 
 ```
-via/
+via-automation-wafer-detect/
 ├── app.py                  # Main Streamlit dashboard
 ├── train.py                # Sensor model training
-├── train_vision.py         # Vision model training
-├── train_vision_real.py    # Vision model (real images)
+├── train_vision.py         # Vision model training (synthetic)
+├── train_vision_real.py    # Vision model (NEU dataset)
+├── train_real_wafer.py     # Real WM-811K wafer dataset training
 ├── train_vae.py            # VAE training
 ├── config.py               # Configuration settings
 ├── requirements.txt        # Python dependencies
